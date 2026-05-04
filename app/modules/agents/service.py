@@ -1,0 +1,580 @@
+"""Service layer for Agent (business logic + transactions)"""
+
+from sqlalchemy import select, and_, delete, func
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, List
+import logging
+import uuid
+from datetime import datetime
+
+from .models import Agent
+from .repository import AgentRepository
+from .audit import AgentAuditLog, AuditEventType
+from . import schemas
+from ...core.neo4j_repository import Neo4jRepository, SecurityError
+from ...core.neo4j_retry import retry_neo4j_operation
+from ...utils.formatters import format_success, format_error
+
+logger = logging.getLogger(__name__)
+
+
+class AgentService:
+    """
+    Agent service - coordinates PostgreSQL and Neo4j operations.
+
+    DISTRIBUTED TRANSACTION PATTERN:
+    ================================
+    We cannot have true ACID across PostgreSQL + Neo4j.
+    Instead, we use compensating transactions:
+
+    CREATE:
+    -------
+    1. PostgreSQL INSERT (not committed)
+    2. Neo4j CREATE node
+    3. If Neo4j fails → Delete Neo4j node (compensation)
+                      → Rollback PostgreSQL
+    4. If success → COMMIT both
+
+    DELETE:
+    -------
+    1. Neo4j DELETE (first, before touching PostgreSQL)
+    2. If Neo4j succeeds → PostgreSQL soft-delete + COMMIT
+    3. If Neo4j fails → ABORT (PostgreSQL untouched = safe)
+
+    Key Principle:
+    - Create: PostgreSQL first (smaller chance of failure)
+    - Delete: Neo4j first (so PostgreSQL stays clean if Neo4j fails)
+    """
+
+    def __init__(self, db: AsyncSession, tenant_id: str):
+        """
+        Initialize agent service.
+
+        Args:
+            db: Database session (for PostgreSQL)
+            tenant_id: Tenant UUID
+        """
+        self.db = db
+        self.tenant_id = uuid.UUID(tenant_id)
+        self.repository = AgentRepository(db, str(self.tenant_id))
+
+    async def create_agent(
+        self,
+        user_id: str,
+        request: schemas.AgentCreate,
+    ) -> dict:
+        """
+        Create a new agent in BOTH PostgreSQL and Neo4j (WITH COMPENSATION).
+
+        TRANSACTION SAFETY WITH COMPENSATION:
+        =====================================
+        1. Create agent in PostgreSQL (not committed yet)
+        2. Create (:Agent) node in Neo4j
+        3. If Neo4j fails:
+           - Delete the Neo4j node we just created (compensation)
+           - Rollback PostgreSQL transaction
+           - Return error
+        4. If both succeed → COMMIT PostgreSQL
+
+        Idempotency:
+        - Unique constraint on (tenant_id, name, is_active=True) prevents duplicates
+        - Retry fails if agent already exists with same name
+
+        Args:
+            user_id: User ID (agent owner)
+            request: AgentCreate schema with name, description, system_prompt
+
+        Returns:
+            Dict with success, agent (AgentResponse), or error
+        """
+        agent_id = None
+        try:
+            # ============= STEP 0: VALIDATION: Uniqueness per user =============
+            existing = await self.repository.get_by_name_and_user(request.name, user_id)
+            if existing:
+                logger.warning(f"⚠️ User {user_id} tried to create duplicate agent name: {request.name}")
+                return format_error(
+                    "You already have an agent with this name. Please choose a different name.",
+                    meta={"status_code": 400}
+                )
+
+            # ============= STEP 1: POSTGRES INSERT (NOT COMMITTED) =============
+            # Create agent in PostgreSQL but don't commit yet
+            pg_agent = await self.repository.create(
+                name=request.name,
+                user_id=user_id,
+                personality=request.personality,
+                personality_id=request.personality_id,
+                system_prompt=request.system_prompt,
+            )
+            agent_id = str(pg_agent.id)
+            logger.info(f"✅ PostgreSQL: Created agent {agent_id}")
+
+            # ============= STEP 2: NEO4J CREATE WITH RETRY =============
+            # Create Agent node in Neo4j with retry handling
+            try:
+                neo4j_repo = Neo4jRepository(str(self.tenant_id))
+
+                neo4j_query = """
+                CREATE (a:Agent {
+                    id: $agent_id,
+                    tenant_id: $tenant_id,
+                    user_id: $user_id,
+                    name: $name,
+                    personality: $personality,
+                    personality_id: $personality_id,
+                    system_prompt: $system_prompt,
+                    created_at: timestamp()
+                })
+                RETURN a
+                """
+
+                # Execute with retry for transient failures
+                await retry_neo4j_operation(
+                    lambda: neo4j_repo.execute_write(
+                        neo4j_query,
+                        {
+                            "agent_id": agent_id,
+                            "tenant_id": str(self.tenant_id),
+                            "user_id": str(user_id),
+                            "name": request.name,
+                            "personality": request.personality,
+                            "personality_id": str(request.personality_id) if request.personality_id else None,
+                            "system_prompt": request.system_prompt or "",
+                        },
+                    )
+                )
+
+                logger.info(f"✅ Neo4j: Created agent node {agent_id}")
+
+            except Exception as neo4j_error:
+                # ============= COMPENSATION: DELETE NEO4J NODE =============
+                # We created a Neo4j node but something failed.
+                # Try to delete it to avoid orphan nodes.
+                logger.warning(f"⚠️ Neo4j creation failed: {neo4j_error}")
+                logger.warning(
+                    f"   Attempting compensation: delete Neo4j node {agent_id}"
+                )
+
+                try:
+                    await retry_neo4j_operation(
+                        lambda: neo4j_repo.execute_write(
+                            """
+                            MATCH (a:Agent {id: $agent_id, tenant_id: $tenant_id})
+                            DETACH DELETE a
+                            """,
+                            {"agent_id": agent_id, "tenant_id": str(self.tenant_id)},
+                        )
+                    )
+                    logger.info(
+                        f"✅ Compensation: Deleted orphan Neo4j node {agent_id}"
+                    )
+                except Exception as comp_error:
+                    logger.error(
+                        f"❌ Compensation failed (orphan node remains): {comp_error}"
+                    )
+
+                # ============= ROLLBACK POSTGRESQL =============
+                await self.db.rollback()
+                logger.error(f"❌ Rolled back PostgreSQL after Neo4j failure")
+
+                return format_error(
+                    f"Failed to create agent graph node (compensation executed): {neo4j_error}",
+                    meta={"error_code": "NEO4J_ERROR"},
+                )
+
+            # ============= STEP 3: COMMIT BOTH TRANSACTIONS =============
+            await self.db.commit()
+            await self.db.refresh(pg_agent) 
+            logger.info(f"✅ COMMITTED: Agent {agent_id} in PostgreSQL + Neo4j")
+
+            # ============= AUDIT LOG =============
+            await AgentAuditLog.log_event(
+                tenant_id=str(self.tenant_id),
+                user_id=user_id,
+                agent_id=agent_id,
+                event_type=AuditEventType.AGENT_CREATED,
+                details={
+                    "name": request.name,
+                    "personality": request.personality,
+                    "has_system_prompt": bool(request.system_prompt),
+                },
+            )
+
+            return format_success(
+                {
+                    "agent": schemas.AgentResponse.model_validate(
+                        pg_agent, from_attributes=True
+                    )
+                },
+                meta={"message": "Agent created successfully"},
+            )
+
+        except Exception as e:
+            # ============= FINAL ROLLBACK ON ANY ERROR =============
+            await self.db.rollback()
+            logger.error(f"❌ Agent creation failed: {e}")
+            return format_error(
+                f"Failed to create agent: {str(e)}", meta={"error_code": "CREATION_ERROR"}
+            )
+
+    async def get_agent(self, agent_id: str) -> dict:
+        """
+        Get agent by ID (PostgreSQL only, Neo4j not needed for read).
+
+        Args:
+            agent_id: Agent UUID
+
+        Returns:
+            Dict with success, agent, or error
+        """
+        try:
+            agent = await self.repository.get_by_id(agent_id)
+
+            if not agent:
+                return format_error(f"Agent not found: {agent_id}", meta={"status_code": 404})
+
+            return format_success(
+                {
+                    "agent": schemas.AgentResponse.model_validate(
+                        agent, from_attributes=True
+                    )
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to get agent: {e}")
+            return format_error(f"Failed to retrieve agent: {str(e)}")
+
+    async def list_agents(self, limit: int = 50, offset: int = 0) -> dict:
+        """
+        List all agents for tenant (PostgreSQL only).
+        """
+        try:
+            agents, total = await self.repository.list_agents(
+                limit=limit, offset=offset
+            )
+
+            return format_success(
+                {
+                    "agents": [
+                        schemas.AgentResponse.model_validate(a, from_attributes=True)
+                        for a in agents
+                    ],
+                    "count": len(agents),
+                    "total": total,
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to list agents: {e}")
+            return format_error(f"Failed to list agents: {str(e)}")
+
+    async def list_agents_enhanced(
+        self, search: Optional[str] = None, limit: int = 50, offset: int = 0
+    ) -> dict:
+        """
+        Get comprehensive agent audit list with User/Tenant/KB details.
+        Supports filtering by agent_name, username, or tenant_name.
+        """
+        try:
+            agents, total = await self.repository.list_agents_enhanced(
+                search=search, limit=limit, offset=offset
+            )
+
+            return format_success(
+                {
+                    "agents": [
+                        schemas.AgentEnhancedResponse.model_validate(a)
+                        for a in agents
+                    ],
+                    "count": len(agents),
+                    "total": total,
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to list enhanced agents: {e}")
+            return format_error(f"Failed to list enhanced agents: {str(e)}")
+
+    async def list_agents_by_user(
+        self, user_id: str, limit: int = 50, offset: int = 0
+    ) -> dict:
+        """
+        List agents created by specific user.
+
+        Args:
+            user_id: User UUID
+            limit: Max results
+            offset: Pagination offset
+
+        Returns:
+            Dict with success, agents list, count
+        """
+        try:
+            agents, total = await self.repository.list_by_user(
+                user_id, limit=limit, offset=offset
+            )
+
+            return format_success(
+                {
+                    "agents": [
+                        schemas.AgentResponse.model_validate(a, from_attributes=True)
+                        for a in agents
+                    ],
+                    "count": len(agents),
+                    "total": total,
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to list user agents: {e}")
+            return format_error(f"Failed to list agents: {str(e)}")
+
+    async def list_agents_by_user_email(
+        self, email: str, limit: int = 50, offset: int = 0
+    ) -> dict:
+        """
+        List all agents created by a specific user identified by email.
+        """
+        from ..auth.models import User
+        from sqlalchemy import select, and_
+        
+        try:
+            # 1. Find user by email within tenant
+            result = await self.db.execute(
+                select(User).where(
+                    and_(
+                        User.email == email,
+                        User.tenant_id == self.tenant_id
+                    )
+                )
+            )
+            user = result.scalar_one_or_none()
+            
+            if not user:
+                return format_error(f"User with email '{email}' not found in this tenant")
+
+            # 2. List agents for this user
+            agents, total = await self.repository.list_by_user(
+                user_id=str(user.id), limit=limit, offset=offset
+            )
+
+            return format_success(
+                {
+                    "agents": [
+                        schemas.AgentResponse.model_validate(a, from_attributes=True)
+                        for a in agents
+                    ],
+                    "count": len(agents),
+                    "total": total,
+                    "owner": {
+                        "id": str(user.id),
+                        "email": user.email,
+                        "name": f"{user.first_name or ''} {user.last_name or ''}".strip()
+                    }
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to list agents for user {email}: {e}")
+            return format_error(f"Failed to retrieve agents for user: {str(e)}")
+
+    async def update_agent(self, user_id: str, agent_id: str, request: schemas.AgentUpdate) -> dict:
+        """
+        Update agent (PostgreSQL + Neo4j sync).
+
+        NOTE: For now, only PostgreSQL is updated. Neo4j update is optional
+        and would require additional schema (versioning, timestamps).
+
+        Args:
+            agent_id: Agent UUID
+            request: AgentUpdate schema with optional fields
+
+        Returns:
+            Dict with success, updated agent, or error
+        """
+        try:
+            # Extract non-None fields
+            update_data = {
+                k: v for k, v in request.model_dump().items() if v is not None
+            }
+
+            if not update_data:
+                return format_error("No fields provided for update", meta={"status_code": 400})
+
+            # ============= STEP 1: POSTGRES UPDATE =============
+            agent = await self.repository.update(agent_id, **update_data)
+
+            if not agent:
+                return format_error(f"Agent not found: {agent_id}", meta={"status_code": 404})
+
+            # ============= STEP 2: NEO4J SYNC (IF NEEDED) =============
+            # Update fields in Neo4j to keep graph consistent with metadata DB
+            if any(k in update_data for k in ["name", "personality", "personality_id", "system_prompt"]):
+                try:
+                    neo4j_repo = Neo4jRepository(str(self.tenant_id))
+                    
+                    # Construct dynamic SET clause for Neo4j
+                    set_clauses = []
+                    params = {"agent_id": agent_id, "tenant_id": str(self.tenant_id)}
+                    
+                    for field in ["name", "personality", "personality_id", "system_prompt"]:
+                        if field in update_data:
+                            value = update_data[field]
+                            if field == "personality_id" and value:
+                                value = str(value)
+                            set_clauses.append(f"a.{field} = ${field}")
+                            params[field] = value
+                    
+                    if set_clauses:
+                        neo4j_query = f"""
+                        MATCH (a:Agent {{id: $agent_id, tenant_id: $tenant_id}})
+                        SET {', '.join(set_clauses)}, a.updated_at = timestamp()
+                        RETURN a
+                        """
+                        
+                        await retry_neo4j_operation(
+                            lambda: neo4j_repo.execute_write(neo4j_query, params)
+                        )
+                        logger.info(f"✅ Neo4j: Updated agent node {agent_id}")
+                        
+                except Exception as neo4j_error:
+                    # NOTE: We don't necessarily rollback PostgreSQL if Neo4j update fails,
+                    # but we should log it. In a "perfect" system, we might want atomic sync.
+                    logger.error(f"⚠️ Neo4j sync failed during update: {neo4j_error}")
+                    # For consistency, we'll continue but return a warning in meta
+                    pass
+
+            await self.db.commit()
+            
+            # CRITICAL: Refresh the agent object to load DB-generated fields like updated_at
+            # This prevents the 'MissingGreenlet' error during Pydantic validation
+            await self.db.refresh(agent)
+
+            # ============= AUDIT LOG =============
+            await AgentAuditLog.log_event(
+                tenant_id=str(self.tenant_id),
+                user_id=user_id,
+                agent_id=agent_id,
+                event_type=AuditEventType.AGENT_UPDATED,
+                details={"updated_fields": list(update_data.keys())},
+            )
+
+            return format_success(
+                {
+                    "agent": schemas.AgentResponse.model_validate(
+                        agent, from_attributes=True
+                    )
+                },
+                meta={"message": "Agent updated successfully"},
+            )
+
+        except Exception as e:
+            await self.db.rollback()
+            logger.error(f"Failed to update agent: {e}")
+            return format_error(f"Failed to update agent: {str(e)}")
+
+    async def delete_agent(self, user_id: str, agent_id: str) -> dict:
+        """
+        Delete agent from BOTH PostgreSQL and Neo4j.
+
+        CRITICAL DELETE ORDER (Neo4j FIRST):
+        ====================================
+        1. Neo4j DELETE FIRST (with explicit cascade)
+           - Remove Agent node + all related: KBs, Chunks, Entities
+           - If fails: Stop here (PostgreSQL untouched = SAFE)
+        2. PostgreSQL soft-delete (set is_active = False, deleted_at = now())
+           - Only if Neo4j succeeded
+        3. COMMIT PostgreSQL
+
+        Why this order?
+        - If Neo4j fails: PostgreSQL is clean (no orphan PG records)
+        - If PostgreSQL fails: Both are rolled back (atomic for PG)
+        - If Neo4j succeeds but network fails: Retry succeeds (idempotent delete)
+
+        Args:
+            agent_id: Agent UUID
+
+        Returns:
+            Dict with success or error
+        """
+        try:
+            # ============= STEP 1: NEO4J DELETE FIRST (CRITICAL) =============
+            # Delete Agent node and cascade to all related nodes
+            neo4j_repo = Neo4jRepository(str(self.tenant_id))
+
+            # Explicit cascade delete with all relationships and tenant_id validation:
+            # Agent → KB → Chunk → Entity
+            delete_query = """
+            MATCH (a:Agent {tenant_id: $tenant_id, id: $agent_id})
+            OPTIONAL MATCH (a)-[:OWNS_KB]->(kb:KnowledgeBase {tenant_id: $tenant_id})
+            OPTIONAL MATCH (kb)-[:HAS_CHUNK]->(c:Chunk {tenant_id: $tenant_id})
+            OPTIONAL MATCH (c)-[:MENTIONS]->(e:Entity {tenant_id: $tenant_id})
+            DETACH DELETE a, kb, c, e
+            RETURN count(a) as deleted_agents
+            """
+
+            try:
+                await retry_neo4j_operation(
+                    lambda: neo4j_repo.execute_write(
+                        delete_query,
+                        {
+                            "agent_id": agent_id,
+                            "tenant_id": str(self.tenant_id),
+                        },
+                    )
+                )
+                logger.info(
+                    f"✅ Neo4j: Deleted agent {agent_id} + cascade (KB, Chunks, Entities)"
+                )
+
+            except Exception as neo4j_error:
+                # ❌ STOP HERE - DO NOT delete from PostgreSQL
+                # PostgreSQL remains untouched, safe to retry
+                logger.error(f"❌ Neo4j deletion failed: {neo4j_error}")
+                logger.error(f"   PostgreSQL NOT modified (safe state)")
+                return format_error(
+                    f"Failed to delete agent from graph: {neo4j_error}",
+                    meta={"error_code": "NEO4J_ERROR"},
+                )
+
+            # ============= STEP 2: POSTGRES SOFT-DELETE (AFTER NEO4J SUCCESS) =============
+            # Only soft-delete if Neo4j succeeded
+            deleted = await self.repository.soft_delete(agent_id)
+
+            if not deleted:
+                # Rare case: agent not found in PostgreSQL
+                # (Could happen if already deleted, or race condition)
+                logger.warning(f"⚠️ Agent not found in PostgreSQL: {agent_id}")
+                logger.warning(f"   Neo4j was deleted but PG has no record")
+                # This is OK - Neo4j is clean, PG is still consistent
+                await self.db.commit()
+                return format_error(
+                    f"Agent not found in PostgreSQL (may already be deleted): {agent_id}",
+                    meta={"status_code": 404},
+                )
+
+            # ============= STEP 3: COMMIT POSTGRESQL =============
+            await self.db.commit()
+            logger.info(f"✅ COMMITTED: Agent {agent_id} soft-deleted from PostgreSQL")
+
+            # ============= AUDIT LOG =============
+            await AgentAuditLog.log_event(
+                tenant_id=str(self.tenant_id),
+                user_id=user_id,
+                agent_id=agent_id,
+                event_type=AuditEventType.AGENT_DELETED,
+                details={"deleted_at": datetime.utcnow().isoformat()},
+            )
+
+            return format_success(
+                {"id": agent_id},
+                meta={"message": "Agent and associated knowledge base deleted successfully"},
+            )
+
+        except Exception as e:
+            # ============= FINAL ROLLBACK =============
+            await self.db.rollback()
+            logger.error(f"❌ Agent deletion failed: {e}")
+            return format_error(f"Failed to delete agent: {str(e)}")

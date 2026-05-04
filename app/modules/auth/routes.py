@@ -1,0 +1,93 @@
+"""Authentication routes: register, login, refresh, API keys"""
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+import logging
+
+from ...core.database import get_db, get_db_public
+from ...utils.formatters import format_success, format_error, format_paginated
+from . import services, schemas
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/auth", tags=["Authentication"])
+
+
+@router.post("/register", status_code=status.HTTP_201_CREATED)
+async def register(
+    request: schemas.RegisterRequest, db: AsyncSession = Depends(get_db_public)
+):
+    """
+    Register a new user and create/join tenant.
+
+    Returns access + refresh tokens on success.
+    """
+    result = await services.register_user(request, db)
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=result.get("error")
+        )
+
+    # Convert models to schemas
+    user_response = schemas.UserResponse.from_orm(result["user"])
+    tenant_response = schemas.TenantResponse.from_orm(result["tenant"])
+
+    login_response = schemas.LoginResponse(
+        user=user_response,
+        tenant=tenant_response,
+        tokens=schemas.TokenResponse(**result["tokens"]),
+    )
+
+    return format_success(data=login_response, meta={"action": "registered"})
+
+
+@router.post("/login")
+async def login(
+    request: schemas.LoginRequest, db: AsyncSession = Depends(get_db_public)
+):
+    """
+    Login with email and password.
+
+    Returns user info, tenant info, and tokens.
+    """
+    result = await services.login_user(request, db)
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=result.get("error")
+        )
+
+    # Convert models to schemas
+    user_response = schemas.UserResponse.from_orm(result["user"])
+    tenant_response = schemas.TenantResponse.from_orm(result["tenant"])
+
+    login_response = schemas.LoginResponse(
+        user=user_response,
+        tenant=tenant_response,
+        tokens=schemas.TokenResponse(**result["tokens"]),
+    )
+
+    return format_success(data=login_response, meta={"action": "authenticated"})
+
+
+@router.post("/refresh")
+async def refresh_token(
+    request: schemas.RefreshTokenRequest, db: AsyncSession = Depends(get_db_public)
+):
+    """
+    Refresh access token using refresh token.
+
+    Returns new access token (refresh token remains same).
+    """
+    result = await services.refresh_access_token(request.refresh_token, db)
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail=result.get("error")
+        )
+
+    return format_success(
+        data=schemas.TokenResponse(**result["tokens"]),
+        meta={"action": "token_refreshed"},
+    )

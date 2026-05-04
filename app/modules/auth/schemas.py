@@ -1,0 +1,114 @@
+"""Authentication Pydantic schemas for request/response validation"""
+
+from pydantic import BaseModel, EmailStr, Field, validator
+from typing import Optional
+from datetime import datetime
+import uuid
+
+
+# ============= REQUEST SCHEMAS =============
+class RegisterRequest(BaseModel):
+    """User registration request"""
+
+    email: EmailStr = Field(..., description="User email address")
+    first_name: str = Field(..., min_length=1, max_length=255)
+    last_name: str = Field(..., min_length=1, max_length=255)
+    password: str = Field(..., min_length=8, max_length=128)
+    tenant_name: Optional[str] = Field(
+        None, description="Create new tenant or join existing"
+    )
+
+    @validator("password")
+    def validate_password_strength(cls, v):
+        """Validate password meets security requirements"""
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain uppercase letter")
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain lowercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain digit")
+        return v
+
+
+class LoginRequest(BaseModel):
+    """User login request"""
+
+    email: EmailStr = Field(..., description="User email")
+    password: str = Field(..., description="User password")
+
+
+class RefreshTokenRequest(BaseModel):
+    """Refresh access token"""
+
+    refresh_token: str = Field(..., description="Refresh token from previous login")
+
+
+class CreateAPIKeyRequest(BaseModel):
+    """Create new API key"""
+
+    name: Optional[str] = Field(None, max_length=255)
+
+
+# ============= RESPONSE SCHEMAS =============
+class TokenResponse(BaseModel):
+    """Token response (access + refresh)"""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int = Field(description="Expiration in seconds")
+
+
+class UserResponse(BaseModel):
+    """User profile response"""
+
+    id: uuid.UUID
+    email: str
+    first_name: str
+    last_name: str
+    tenant_id: uuid.UUID
+    is_active: bool
+    is_admin: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TenantResponse(BaseModel):
+    """Tenant response"""
+
+    id: uuid.UUID
+    name: str
+    slug: str
+    description: Optional[str]
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class APIKeyResponse(BaseModel):
+    """API Key response (public representation)"""
+
+    id: uuid.UUID
+    name: Optional[str]
+    is_active: bool
+    last_used_at: Optional[datetime]
+    created_at: datetime
+
+    # NOTE: key_hash is NOT included for security
+
+    class Config:
+        from_attributes = True
+
+
+class LoginResponse(BaseModel):
+    """Login response with user and token data"""
+
+    user: UserResponse
+    tenant: TenantResponse
+    tokens: TokenResponse

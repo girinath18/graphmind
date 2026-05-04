@@ -1,0 +1,1 @@
+"""GraphMind FastAPI Application Package"""

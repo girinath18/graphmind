@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+mind/
+
+# Environment Variables
+.env
+.env.production
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# Project specific
+tester_zone/
+tests/
+scratch/
+tmp/
+.vscode/
+.idea/
+.streamlit/
+
+# Analysis docs
+cognee_full_analysis_part*.md
+competitor_strategic_analysis.md
+API_DOCUMENTATION.md
+
+# Testing scripts in root
+check_user_columns.py
+debug_db.py
+drop_tables.py
+test_triplet_diag.py
+
+# Large files
+*.pptx
+*.pdf
+
+# Streamlit
+.streamlit/config.toml

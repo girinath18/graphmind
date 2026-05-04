@@ -1,0 +1,279 @@
+# ============================================================================
+# GraphMind Configuration Flow: .env → config.yaml → Python (core/config.py)
+# ============================================================================
+#
+# PHILOSOPHY:
+# 1. Never hardcode secrets (credentials, keys, passwords)
+# 2. Load all config from environment variables (.env file)
+# 3. Validate and structure in config.py using Pydantic BaseSettings
+# 4. Inject into services via dependency injection
+# 5. Use this YAML as documentation only (not loaded at runtime)
+#
+# FLOW:
+#   .env file (local development) 
+#   → Environment variables (Docker, K8s, servers)
+#   → app/core/config.py (Pydantic BaseSettings)
+#   → get_settings() dependency
+#   → Injected into services/routes
+#
+# ============================================================================
+
+# ============================================================================
+# APPLICATION CORE
+# ============================================================================
+application:
+  name: GraphMind
+  version: "1.0.0"
+  environment: development  # development, staging, production
+  debug: true              # Set to false in production
+  host: "0.0.0.0"
+  port: 8000
+
+# ============================================================================
+# DATABASE CONFIGURATION
+# ============================================================================
+
+# PostgreSQL (Primary relational database)
+# Used for: Users, Tenants, API Keys, Audit logs, Billing
+postgresql:
+  driver: asyncpg  # Async Python driver
+  user: ${POSTGRES_USER}              # Loaded from .env
+  password: ${POSTGRES_PASSWORD}      # Loaded from .env
+  host: ${POSTGRES_HOST}              # Default: localhost
+  port: ${POSTGRES_PORT}              # Default: 5432
+  database: ${POSTGRES_DB}            # Default: graphmind_dev
+  
+  # Connection pool settings
+  pool:
+    size: ${POSTGRES_POOL_SIZE}                    # Default: 10
+    max_overflow: ${POSTGRES_MAX_OVERFLOW}         # Default: 20
+    recycle_seconds: ${POSTGRES_POOL_RECYCLE}     # Default: 3600 (1 hour)
+    pre_ping: true                        # Check connection health before use
+  
+  # Logging
+  echo_sql: ${POSTGRES_ECHO}  # Log SQL queries in debug mode
+  
+  # Security: Row-Level Security (RLS)
+  features:
+    - row_level_security: true  # CRITICAL: Enforce tenant isolation at DB level
+    - connection_pooling: true
+    - connection_encryption: false  # Set to true in production with SSL
+
+# Neo4j (Graph database)
+# Used for: Agents, Knowledge Bases, Chunks, Relationships, Semantic links
+neo4j:
+  uri: ${NEO4J_URI}                    # bolt://localhost:7687
+  user: ${NEO4J_USER}                  # neo4j
+  password: ${NEO4J_PASSWORD}          # **** (change in production)
+  
+  # Connection pool
+  pool:
+    size: ${NEO4J_POOL_SIZE}                             # Default: 10
+    max_connection_lifetime: ${NEO4J_MAX_CONNECTION_LIFETIME}  # seconds
+  
+  # Graph features
+  features:
+    - multi_hop_queries: true    # Enable PathFinding - find similar chunks
+    - semantic_edges: true       # Store embeddings, similarity scores
+    - versioning: true          # Track KB versions as linked nodes
+    - entity_relationships: true # Find chunks that mention same entities
+
+# ============================================================================
+# SECURITY & AUTHENTICATION
+# ============================================================================
+
+security:
+  # JWT Tokens
+  jwt:
+    secret_key: ${JWT_SECRET_KEY}              # CRITICAL: 32+ chars, random
+    algorithm: ${JWT_ALGORITHM}                # HS256
+    access_token_expiration_minutes: ${ACCESS_TOKEN_EXPIRE_MINUTES}    # Default: 30
+    refresh_token_expiration_days: ${REFRESH_TOKEN_EXPIRE_DAYS}        # Default: 7
+  
+  # Password Policy
+  password:
+    min_length: ${PASSWORD_MIN_LENGTH}                    # Default: 8
+    require_uppercase: true    # Must have A-Z
+    require_lowercase: true    # Must have a-z
+    require_digits: true       # Must have 0-9
+    require_special: false     # Must have !@#$%^&* (optional)
+    bcrypt_rounds: 12          # Cost factor for bcrypt hashing
+  
+  # Encryption (Per-Tenant)
+  encryption:
+    algorithm: fernet          # Fernet (AES-128 symmetric)
+    per_tenant_keys: true      # Each tenant has own encryption key
+    # Example: TENANT_<uuid>_ENCRYPTION_KEY=<fernet-key>
+
+# ============================================================================
+# MULTI-TENANCY & ISOLATION
+# ============================================================================
+
+multi_tenancy:
+  enforcement:
+    # Layer 1: FastAPI Middleware (JWT extraction)
+    jwt_validation: true       # Decode JWT, extract tenant_id
+    
+    # Layer 2: Repository queries (WHERE clause on tenant_id)
+    query_filtering: true      # Every query includes tenant_id filter
+    
+    # Layer 3: Database RLS policies
+    row_level_security: true   # PostgreSQL enforces tenant_id filtering
+  
+  isolation_checks:
+    - jwt_contains_tenant_id: true    # Verify JWT has tenant_id claim
+    - request_has_tenant_state: true  # Verify request.state.tenant_id set
+    - query_filters_tenant: true      # Verify WHERE tenant_id = ... in all queries
+
+# ============================================================================
+# EXTERNAL SERVICES & INTEGRATIONS
+# ============================================================================
+
+external_services:
+  # DeepInfra (LLM API for RAG generation)
+  deepinfra:
+    api_key: ${DEEPINFRA_API_KEY}
+    api_url: ${DEEPINFRA_API_URL}
+    
+    # Models available via DeepInfra
+    models:
+      - meta-llama/Llama-2-70b-chat-hf
+      - openai/gpt-3.5-turbo
+      - openai/gpt-4
+    
+    # Rate limiting
+    rate_limit:
+      requests_per_minute: 60
+      tokens_per_minute: 90000
+  
+  # Optional: Embeddings service
+  embeddings:
+    provider: sentence-transformers  # local or api
+    model: all-MiniLM-L6-v2         # 384-dim embeddings
+
+# ============================================================================
+# LOGGING & MONITORING
+# ============================================================================
+
+logging:
+  level: ${LOG_LEVEL}        # DEBUG, INFO, WARNING, ERROR
+  format: ${LOG_FORMAT}      # json or text
+  
+  outputs:
+    - type: console          # stdout
+      level: ${LOG_LEVEL}
+    
+    - type: file
+      path: logs/app.log
+      level: INFO
+      rotation: daily
+      retention: 30          # Keep 30 days
+  
+  # Log sensitive operations
+  audit:
+    enabled: true
+    log_all_db_writes: true  # For compliance
+    log_auth_events: true    # login, register, token refresh
+    log_data_access: true    # Who accessed what data
+
+# ============================================================================
+# RATE LIMITING & PERFORMANCE
+# ============================================================================
+
+rate_limiting:
+  enabled: ${RATE_LIMIT_ENABLED}
+  
+  limits:
+    # Per-user limits
+    per_user:
+      requests_per_minute: ${RATE_LIMIT_REQUESTS_PER_MINUTE}
+      requests_per_hour: ${RATE_LIMIT_REQUESTS_PER_HOUR}
+    
+    # Per-endpoint limits (RAG queries more expensive)
+    per_endpoint:
+      /api/v1/auth/login: 10/minute
+      /api/v1/rag/query: 30/hour  # RAG is expensive
+  
+  # Billing enforcement (future)
+  plan_limits:
+    free: 100/month
+    pro: 10000/month
+    enterprise: unlimited
+
+# ============================================================================
+# CORS (Cross-Origin Resource Sharing)
+# ============================================================================
+
+cors:
+  enabled: true
+  origins: ${CORS_ORIGINS}           # ["*"] or specific domains
+  credentials: ${CORS_CREDENTIALS}   # Allow cookies/auth headers
+  methods:
+    - GET
+    - POST
+    - PUT
+    - DELETE
+    - PATCH
+  headers:
+    - "*"
+
+# ============================================================================
+# ENVIRONMENT PROFILES
+# ============================================================================
+
+profiles:
+  
+  # Development: Local machine, debug enabled, verbose logging
+  development:
+    debug: true
+    postgres_echo: true
+    log_level: DEBUG
+    cors_origins: ["http://localhost:3000", "http://localhost:8000"]
+    jwt_secret_key: dev-key-not-secure-change-before-production
+    database_url: postgresql+asyncpg://graphmind_user:password@localhost:5432/graphmind_dev
+  
+  # Staging: Pre-production, verbose logging, RLS enabled
+  staging:
+    debug: false
+    postgres_echo: false
+    log_level: INFO
+    cors_origins: ["https://staging.graphmind.io"]
+    jwt_secret_key: staging-key-from-env-variable
+    database_url: postgresql+asyncpg://user:**@staging-db:5432/graphmind
+    rate_limit_enabled: true
+  
+  # Production: High security, minimal logging, RLS enforced
+  production:
+    debug: false
+    postgres_echo: false
+    log_level: INFO
+    cors_origins: ["https://graphmind.io"]
+    jwt_secret_key: ${JWT_SECRET_KEY}  # From environment only
+    database_url: ${DATABASE_URL}      # From environment only
+    rate_limit_enabled: true
+    https_only: true
+    ssl_verify: true
+
+# ============================================================================
+# DEPLOYMENT CHECKLIST
+# ============================================================================
+#
+# Before deploying to production, ensure:
+#
+# ✅ JWT_SECRET_KEY is 32+ characters, random, NOT default value
+# ✅ POSTGRES_PASSWORD is strong (16+ chars, mixed case, special chars)
+# ✅ NEO4J_PASSWORD is changed from default
+# ✅ DEEPINFRA_API_KEY is set and valid
+# ✅ DEBUG=false
+# ✅ LOG_LEVEL=INFO or WARNING
+# ✅ CORS_ORIGINS is restricted (not ["*"])
+# ✅ POSTGRES_ECHO=false
+# ✅ DATABASE_URL uses SSL connection string
+# ✅ Secrets stored in secure vault (AWS Secrets Manager, etc.)
+# ✅ Run database migrations (alembic upgrade head)
+# ✅ Create Neo4j constraints/indexes
+# ✅ Health check passes: GET /health
+# ✅ Auth flow tested: POST /api/v1/auth/register → login → refresh
+# ✅ Rate limiting operational
+#
+# ============================================================================

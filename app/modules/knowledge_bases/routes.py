@@ -1,0 +1,513 @@
+"""REST routes for Knowledge Base CRUD and document ingestion"""
+
+from fastapi import APIRouter, Request, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+import logging
+import uuid
+
+from .service import KnowledgeBaseService
+from . import schemas
+from ...core.database import AsyncSessionLocal
+from ...utils.formatters import format_error, format_success
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/api/v1/knowledge-bases", tags=["knowledge-bases"])
+
+
+# ============================================================================
+# REQUEST CONTEXT HELPERS
+# ============================================================================
+
+
+def get_tenant_and_user(request: Request) -> tuple[str, str]:
+    """
+    Extract tenant_id and user_id from request context (set by middleware).
+
+    CRITICAL: These are injected by TenantContextMiddleware.
+    Never trust values from request body or query params.
+
+    Returns:
+        Tuple of (tenant_id, user_id)
+
+    Raises:
+        HTTPException if not found in request state
+    """
+    tenant_id = getattr(request.state, "tenant_id", None)
+    user_id = getattr(request.state, "user_id", None)
+
+    if not tenant_id or not user_id:
+        logger.error("Missing tenant_id or user_id in request state")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return str(tenant_id), str(user_id)
+
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
+
+@router.post(
+    "",
+    response_model=dict,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create Knowledge Base",
+    description="Create a new knowledge base for an agent",
+)
+async def create_kb(
+    request: Request,
+    kb_request: schemas.KBCreate,
+) -> dict:
+    """
+    Create a new knowledge base linked to an agent.
+
+    Creates KB in BOTH:
+    1. PostgreSQL (metadata storage)
+    2. Neo4j (graph node for chunk relationships)
+
+    TRANSACTION SAFETY:
+    - If either database fails, entire operation is rolled back
+    - No orphaned nodes or records
+
+    Args:
+        request: FastAPI request (contains tenant_id in state)
+        kb_request: KBCreate schema with name, agent_id, description
+
+    Returns:
+        JSON response with created KB
+
+    Raises:
+        HTTPException 401: Not authenticated
+        HTTPException 400: Invalid request
+        HTTPException 500: Database error
+    """
+    try:
+        tenant_id, user_id = get_tenant_and_user(request)
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.create_knowledge_base(user_id, kb_request)
+
+            if not result.get("success"):
+                error_msg = result.get("error", "Unknown error")
+                status_code = result.get("status_code", 400)
+                raise HTTPException(status_code=status_code, detail=error_msg)
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create KB endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/{kb_id}",
+    response_model=dict,
+    summary="Get Knowledge Base",
+    description="Get a knowledge base by ID",
+)
+async def get_kb(request: Request, kb_id: str) -> dict:
+    """
+    Get a knowledge base by ID.
+
+    Args:
+        request: FastAPI request
+        kb_id: KB UUID
+
+    Returns:
+        JSON response with KB details
+
+    Raises:
+        HTTPException 401: Not authenticated
+        HTTPException 404: KB not found
+        HTTPException 500: Database error
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.get_kb(kb_id)
+
+            if not result.get("success"):
+                error_msg = result.get("error", "Unknown error")
+                status_code = result.get("status_code", 404)
+                raise HTTPException(status_code=status_code, detail=error_msg)
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get KB endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "",
+    response_model=dict,
+    summary="List Knowledge Bases",
+    description="List all knowledge bases for the tenant",
+)
+async def list_kbs(request: Request, limit: int = 50, offset: int = 0) -> dict:
+    """
+    List all knowledge bases for the tenant with pagination.
+
+    Args:
+        request: FastAPI request
+        limit: Max results (default 50)
+        offset: Pagination offset (default 0)
+
+    Returns:
+        JSON response with KBs list
+
+    Raises:
+        HTTPException 401: Not authenticated
+        HTTPException 500: Database error
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        # Validate pagination
+        if limit < 1 or limit > 1000:
+            limit = 50
+        if offset < 0:
+            offset = 0
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.list_kbs(limit=limit, offset=offset)
+
+            if not result.get("success"):
+                raise HTTPException(status_code=500, detail=result.get("error"))
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"List KBs endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get(
+    "/agents/{agent_id}",
+    response_model=dict,
+    summary="List Knowledge Bases for Agent",
+    description="List all knowledge bases for a specific agent",
+)
+async def list_agent_kbs(
+    request: Request,
+    agent_id: str,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """
+    List knowledge bases for a specific agent.
+
+    Args:
+        request: FastAPI request
+        agent_id: Agent UUID
+        limit: Max results (default 50)
+        offset: Pagination offset (default 0)
+
+    Returns:
+        JSON response with KBs list
+
+    Raises:
+        HTTPException 401: Not authenticated
+        HTTPException 500: Database error
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        # Validate pagination
+        if limit < 1 or limit > 1000:
+            limit = 50
+        if offset < 0:
+            offset = 0
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.list_kbs_by_agent(
+                agent_id, limit=limit, offset=offset
+            )
+
+            if not result.get("success"):
+                raise HTTPException(status_code=500, detail=result.get("error"))
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"List agent KBs endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/{kb_id}/ingest",
+    response_model=dict,
+    summary="Ingest Document",
+    description="Upload and ingest a document into a knowledge base",
+)
+async def ingest_document(
+    request: Request,
+    kb_id: str,
+    body: dict,  # {"document_text": "..."}
+) -> dict:
+    """
+    Ingest a document into a knowledge base.
+
+    PROCESS:
+    1. Validate KB exists
+    2. Split text into chunks (500-1000 tokens, overlap)
+    3. Generate embeddings for each chunk
+    4. Store chunks in Neo4j
+    5. Create Chunk→Chunk(NEXT) relationships
+
+    Args:
+        request: FastAPI request
+        kb_id: KB UUID
+        body: Request body with "document_text" field
+
+    Returns:
+        JSON response with chunks created count
+
+    Raises:
+        HTTPException 401: Not authenticated
+        HTTPException 404: KB not found
+        HTTPException 400: Invalid request
+        HTTPException 500: Database error
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        # Extract document text
+        document_text = body.get("document_text", "").strip()
+        if not document_text:
+            raise HTTPException(status_code=400, detail="document_text is required")
+
+        if len(document_text) > 1_000_000:  # 1MB limit
+            raise HTTPException(status_code=400, detail="Document too large (max 1MB)")
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.ingest_document(kb_id, document_text)
+
+            if not result.get("success"):
+                error_msg = result.get("error", "Unknown error")
+                status_code = result.get("status_code", 400)
+                raise HTTPException(status_code=status_code, detail=error_msg)
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ingest document endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+from fastapi import UploadFile, File
+
+@router.post(
+    "/{kb_id}/ingest/pdf",
+    response_model=dict,
+    summary="Ingest PDF Document",
+    description="Upload and ingest a PDF file into a knowledge base. Uses Gdocz SDK as primary extractor with pdfplumber fallback.",
+)
+async def ingest_pdf(
+    request: Request,
+    kb_id: str,
+    file: UploadFile = File(...),
+) -> dict:
+    """
+    Ingest a PDF document into a knowledge base.
+
+    EXTRACTION STRATEGY:
+    1. Gdocz SDK (primary) — Cloud API, handles complex/scanned PDFs
+    2. pdfplumber + AI-OCR (fallback) — Local extraction if Gdocz fails
+    3. Markdown cleaning — Strip formatting for optimal embedding quality
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="File must be a PDF")
+
+        content = await file.read()
+        if len(content) > 10 * 1024 * 1024:  # 10MB limit
+            raise HTTPException(status_code=400, detail="PDF too large (max 10MB)")
+
+        # Extract PDF using PDFExtractor (Gdocz primary + pdfplumber fallback)
+        from ...core.pdf_extractor import PDFExtractor
+
+        try:
+            document_text = await PDFExtractor.extract(
+                pdf_bytes=content,
+                filename=file.filename,
+                tenant_id=tenant_id,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error(f"PDF extraction failed: {e}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to extract text from PDF: {str(e)}",
+            )
+
+        if not document_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract any text from the PDF",
+            )
+
+        # Reuse existing ingestion logic
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.ingest_document(kb_id, document_text)
+
+            if not result.get("success"):
+                error_msg = result.get("error", "Unknown error")
+                status_code = result.get("status_code", 400)
+                raise HTTPException(status_code=status_code, detail=error_msg)
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ingest PDF endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/{kb_id}/ingest/url",
+    response_model=dict,
+    summary="Ingest URL Content",
+    description="Crawl a URL and ingest its content into the knowledge base. Uses Gcrawl API with BeautifulSoup fallback.",
+)
+async def ingest_url(
+    request: Request,
+    kb_id: str,
+    ingest_request: schemas.KBURLIngest,
+) -> dict:
+    """
+    Ingest content from a URL into a knowledge base.
+
+    STRATEGY:
+    1. Scrape content using ScraperService (Gcrawl + BS4 fallback)
+    2. Normalize multiple pages if crawl_type is 'all'
+    3. Ingest each page's content into the KB
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        from .services.scraper_service import ScraperService
+
+        # 1. Scrape content
+        documents = await ScraperService.extract_website_content(
+            url=ingest_request.url,
+            crawl_type=ingest_request.crawl_type,
+            proxy_mode=ingest_request.proxy_mode
+        )
+
+        if not documents:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract any content from the provided URL"
+            )
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+
+            total_chunks = 0
+            results = []
+
+            # 2. Ingest each document
+            for doc in documents:
+                # Prepare document text with source header
+                content = doc["content"]
+                if len(documents) > 1:
+                    content = f"# SOURCE: {doc['source']}\n\n{content}"
+
+                ingest_result = await service.ingest_document(kb_id, content)
+
+                if ingest_result.get("success"):
+                    total_chunks += ingest_result["data"]["chunks_created"]
+                    results.append({
+                        "source": doc["source"],
+                        "chunks": ingest_result["data"]["chunks_created"]
+                    })
+
+            if not results:
+                raise HTTPException(status_code=500, detail="Failed to ingest any content")
+
+            return format_success(
+                {
+                    "kb_id": kb_id,
+                    "total_pages": len(results),
+                    "total_chunks_created": total_chunks,
+                    "details": results
+                },
+                meta={"message": f"Successfully ingested {len(results)} pages from {ingest_request.url}"}
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"URL ingestion endpoint error: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+
+@router.delete(
+    "/{kb_id}",
+    response_model=dict,
+    summary="Delete Knowledge Base",
+    description="Delete a knowledge base and all its chunks",
+)
+async def delete_kb(request: Request, kb_id: str) -> dict:
+    """
+    Delete a knowledge base.
+
+    Deletes KB from BOTH:
+    1. Neo4j (KB node + cascade chunks)
+    2. PostgreSQL (soft-delete)
+
+    Args:
+        request: FastAPI request
+        kb_id: KB UUID
+
+    Returns:
+        JSON response with deletion confirmation
+
+    Raises:
+        HTTPException 401: Not authenticated
+        HTTPException 404: KB not found
+        HTTPException 500: Database error
+    """
+    try:
+        tenant_id, _ = get_tenant_and_user(request)
+
+        async with AsyncSessionLocal() as db:
+            service = KnowledgeBaseService(db, tenant_id)
+            result = await service.delete_kb(kb_id)
+
+            if not result.get("success"):
+                error_msg = result.get("error", "Unknown error")
+                status_code = result.get("status_code", 404)
+                raise HTTPException(status_code=status_code, detail=error_msg)
+
+            return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Delete KB endpoint error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")

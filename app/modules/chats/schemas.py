@@ -1,0 +1,146 @@
+"""Pydantic schemas for Chat History & Memory API
+
+REQUEST/RESPONSE VALIDATION:
+    - All request bodies validated via Pydantic
+    - Response models match existing StandardResponse pattern
+    - Optional fields have sensible defaults
+    - UUID validation on path/body params
+
+PATTERN: Matches existing schema conventions from agents/schemas.py and rag/schemas.py
+"""
+
+from uuid import UUID
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
+from datetime import datetime
+
+
+# ============================================================================
+# REQUEST SCHEMAS
+# ============================================================================
+
+
+class SendMessageRequest(BaseModel):
+    """Send a message to an agent within a chat session.
+
+    If session_id is omitted, a new session is created automatically.
+    """
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=5000,
+        description="User message to send to the agent",
+    )
+    session_id: Optional[str] = Field(
+        None,
+        description="Existing session ID. Omit to create a new session.",
+    )
+    top_k: Optional[int] = Field(
+        10,
+        ge=5,
+        le=50,
+        description="Initial seed chunks for RAG retrieval",
+    )
+    max_depth: Optional[int] = Field(
+        2,
+        ge=1,
+        le=3,
+        description="Graph expansion depth",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "message": "What is the main topic of this knowledge base?",
+                "session_id": None,
+            }
+        }
+
+
+class CreateSessionRequest(BaseModel):
+    """Explicitly create a new chat session."""
+
+    title: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="Session title. Auto-generated from first message if omitted.",
+    )
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "title": "Research Discussion",
+            }
+        }
+
+
+class UpdateSessionRequest(BaseModel):
+    """Update a chat session (rename, etc.)."""
+
+    title: Optional[str] = Field(
+        None,
+        max_length=500,
+        description="New session title",
+    )
+
+
+# ============================================================================
+# RESPONSE SCHEMAS
+# ============================================================================
+
+
+class MessageResponse(BaseModel):
+    """Single chat message in response."""
+
+    id: str = Field(..., description="Message UUID")
+    role: str = Field(..., description="Message role: 'user' or 'assistant'")
+    content: str = Field(..., description="Message content")
+    position: int = Field(..., description="Message position in session (0-indexed)")
+    metadata: Optional[Dict[str, Any]] = Field(
+        None, description="RAG metadata for assistant messages"
+    )
+    created_at: Optional[str] = Field(None, description="ISO timestamp")
+
+
+class SessionResponse(BaseModel):
+    """Chat session summary in response."""
+
+    id: str = Field(..., description="Session UUID")
+    agent_id: str = Field(..., description="Agent UUID")
+    title: str = Field(..., description="Session title")
+    message_count: int = Field(0, description="Total messages in session")
+    is_active: bool = Field(True, description="Whether session is active")
+    last_message_at: Optional[str] = Field(None, description="Last message ISO timestamp")
+    created_at: Optional[str] = Field(None, description="Session creation ISO timestamp")
+
+
+class SessionDetailResponse(BaseModel):
+    """Chat session with all messages."""
+
+    session: SessionResponse = Field(..., description="Session metadata")
+    messages: List[MessageResponse] = Field(
+        default_factory=list, description="All messages in order"
+    )
+
+
+class SendMessageResponse(BaseModel):
+    """Response after sending a message (includes agent reply)."""
+
+    session_id: str = Field(..., description="Session UUID (new or existing)")
+    answer: str = Field(..., description="Agent's generated answer")
+    sources: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Source chunks with scores"
+    )
+    context: Optional[Dict[str, Any]] = Field(
+        None, description="RAG context metadata (kb_name, chunks_used, etc.)"
+    )
+    message_position: int = Field(
+        ..., description="Position of the assistant message in the session"
+    )
+    memory_used: bool = Field(
+        False, description="Whether conversation history was injected into context"
+    )
+    conversation_turns: int = Field(
+        0, description="Number of user-assistant exchanges in this session"
+    )
