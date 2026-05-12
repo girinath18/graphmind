@@ -132,6 +132,10 @@ class Settings(BaseSettings):
     triplet_retrieval_top_k: int = 10  # Triplets to retrieve during RAG query
     use_personal_memory: bool = False  # Phase 5: Enable user-specific personalization (Mem0 Pattern)
 
+    # ============= INGESTION & PERFORMANCE =============
+    ingestion_llm_concurrency: int = 15  # Max parallel LLM extractions (Phase 4A)
+    ingestion_llm_timeout: float = 60.0  # Extended timeout for complex extractions
+    
     # ============= SIMILARITY SEARCH CONFIG =============
     # Hybrid mode: Use O(n²) for small KBs, vector index for large
     similarity_brute_force_threshold: int = 500  # Use O(n²) if chunks < this

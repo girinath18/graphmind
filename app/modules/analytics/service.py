@@ -41,14 +41,8 @@ class AnalyticsService:
         if stats["total_queries"] > 0:
             accuracy = (stats["answered_queries"] / stats["total_queries"]) * 100
 
-        # Dummy distribution for now
-        distribution = [
-            {"bucket": "0.0-0.2", "count": 0},
-            {"bucket": "0.2-0.4", "count": 0},
-            {"bucket": "0.4-0.6", "count": 0},
-            {"bucket": "0.6-0.8", "count": 0},
-            {"bucket": "0.8-1.0", "count": 0},
-        ]
+        # Real distribution from logs
+        distribution = await self.repo.get_confidence_distribution()
 
         return DashboardMetrics(
             total_queries=stats["total_queries"],

@@ -26,8 +26,8 @@ from ..config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Global rate limiter (max 10 concurrent API calls)
-_embedding_semaphore = asyncio.Semaphore(10)
+# Global rate limiter (max 25 concurrent API calls)
+_embedding_semaphore = asyncio.Semaphore(25)
 
 # Global embedding cache (text_hash -> embedding vector)
 # With LRU eviction to prevent unbounded memory growth
@@ -273,27 +273,78 @@ class DeepInfraEmbeddingClient:
 
     async def generate_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """
-        Generate embeddings for multiple texts in parallel.
+        Generate embeddings for multiple texts using TRUE API BATCHING.
 
         PHASE 3.5 ENHANCEMENT:
-        Uses asyncio.gather to call generate_embedding for all texts concurrently.
-        The _embedding_semaphore (max 10) ensures we don't overwhelm the API
-        or hit rate limits too hard.
-
+        Sends up to 50 texts in a single HTTP request. This dramatically 
+        reduces HTTP overhead and allows the server to process chunks in parallel.
+        
         Args:
             texts: List of texts to embed
-
+            
         Returns:
-            List of embeddings (same length as texts)
+            List of embeddings (same length as input)
         """
-        logger.info(f"🚀 Batch generating {len(texts)} embeddings in parallel...")
+        if not texts:
+            return []
+            
+        # 1. Filter out already cached embeddings to save API costs
+        results_map = {} # index -> embedding
+        to_embed_indices = []
+        to_embed_texts = []
         
-        # Create tasks for all texts
-        tasks = [self.generate_embedding(text) for text in texts]
+        for i, text in enumerate(texts):
+            text_hash = hashlib.sha256(text.encode()).hexdigest()
+            if text_hash in _embedding_cache:
+                results_map[i] = _embedding_cache[text_hash]
+            else:
+                to_embed_indices.append(i)
+                to_embed_texts.append(text)
+                
+        if not to_embed_texts:
+            logger.info(f"✅ All {len(texts)} embeddings retrieved from cache")
+            return [results_map[i] for i in range(len(texts))]
+
+        logger.info(f"🚀 API Batch generating {len(to_embed_texts)} embeddings (out of {len(texts)} total)...")
         
-        # Execute all tasks in parallel
-        # Note: Each task will still wait for the semaphore inside generate_embedding
-        embeddings = await asyncio.gather(*tasks)
+        # 2. Process in chunks of 50 (API limit safety)
+        batch_size = 50
+        all_new_embeddings = []
         
-        logger.info(f"✅ Generated {len(embeddings)} embeddings in parallel")
-        return embeddings
+        for i in range(0, len(to_embed_texts), batch_size):
+            chunk = to_embed_texts[i:i+batch_size]
+            
+            async with _embedding_semaphore:
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
+                payload = {
+                    "model": self.model,
+                    "input": chunk,
+                }
+                
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(self.base_url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Extract embeddings: {"data": [{"embedding": [...], "index": 0}, ...]}
+                    new_batch = [item["embedding"] for item in sorted(data["data"], key=lambda x: x["index"])]
+                    all_new_embeddings.extend(new_batch)
+                    
+                    # Update cache
+                    for j, emb in enumerate(new_batch):
+                        orig_text = chunk[j]
+                        t_hash = hashlib.sha256(orig_text.encode()).hexdigest()
+                        _embedding_cache[t_hash] = emb
+                        if t_hash not in _embedding_cache_insertion_order:
+                            _embedding_cache_insertion_order.append(t_hash)
+
+        # 3. Reconstruct full list in original order
+        for i, idx in enumerate(to_embed_indices):
+            results_map[idx] = all_new_embeddings[i]
+            
+        final_results = [results_map[i] for i in range(len(texts))]
+        logger.info(f"✅ Batch generation complete: {len(texts)} embeddings")
+        return final_results

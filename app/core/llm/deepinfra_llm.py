@@ -38,8 +38,8 @@ PROMPT_VERSION = "v1"
 PRICE_PER_1M_INPUT_TOKENS = 0.05
 PRICE_PER_1M_OUTPUT_TOKENS = 0.15
 
-# Global rate limiter (max 5 concurrent LLM calls)
-_llm_semaphore = asyncio.Semaphore(5)
+# Global rate limiter (controlled by .env INGESTION_LLM_CONCURRENCY)
+_llm_semaphore = asyncio.Semaphore(settings.ingestion_llm_concurrency)
 
 # LLM call metrics
 _llm_calls = 0
@@ -112,7 +112,7 @@ class DeepInfraLLMClient:
         self.api_key = settings.deepinfra_api_key
         self.base_url = "https://api.deepinfra.com/v1/openai/chat/completions"
         self.model = "Qwen/Qwen2.5-72B-Instruct"
-        self.timeout = 15.0  # Request timeout in seconds
+        self.timeout = settings.ingestion_llm_timeout  # Request timeout from config
         self.max_retries = 3  # Number of retry attempts
         self.max_tokens = 1024  # Max output tokens (GUARD: prevent very long responses)
         self.max_answer_length = 2000  # Max chars in answer (latency + cost guard)
@@ -211,7 +211,7 @@ class DeepInfraLLMClient:
         for attempt in range(3):
             try:
                 async with _llm_semaphore:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
+                    async with httpx.AsyncClient(timeout=self.timeout) as client:
                         response = await client.post(self.base_url, headers=headers, json=payload)
                         response.raise_for_status()
                         data = response.json()

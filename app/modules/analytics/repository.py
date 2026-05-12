@@ -4,7 +4,7 @@ Analytics Repository - Database abstraction for analytics entities.
 
 from typing import List, Optional, Tuple
 from uuid import UUID
-from sqlalchemy import select, func, update, delete
+from sqlalchemy import select, func, update, delete, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from .models import AnalyticsSummary, AnalyticsQueryLog, ResponseStatus
 
@@ -64,21 +64,25 @@ class AnalyticsRepository:
         return result.scalars().all()
 
     async def get_aggregated_metrics(self) -> dict:
-        """Fetch high-level metrics for dashboard."""
+        """Fetch high-level metrics for dashboard directly from logs."""
         stmt = select(
-            func.sum(AnalyticsSummary.total_queries).label("total"),
-            func.sum(AnalyticsSummary.answered_queries).label("answered"),
-            func.sum(AnalyticsSummary.unanswered_queries).label("unanswered"),
-            func.avg(AnalyticsSummary.avg_confidence).label("avg_conf")
-        ).where(AnalyticsSummary.tenant_id == self.tenant_id)
+            func.count(AnalyticsQueryLog.id).label("total"),
+            func.count(AnalyticsQueryLog.id).filter(
+                AnalyticsQueryLog.response_status == ResponseStatus.SUCCESS
+            ).label("answered"),
+            func.count(AnalyticsQueryLog.id).filter(
+                AnalyticsQueryLog.response_status == ResponseStatus.UNANSWERED
+            ).label("unanswered"),
+            func.avg(AnalyticsQueryLog.confidence_score).label("avg_conf")
+        ).where(AnalyticsQueryLog.tenant_id == self.tenant_id)
         
         result = await self.db.execute(stmt)
         row = result.first()
         
         return {
             "total_queries": row.total or 0,
-            "answered_queries": row.answered or 0,
-            "unanswered_queries": row.unanswered or 0,
+            "answered_queries": int(row.answered or 0),
+            "unanswered_queries": int(row.unanswered or 0),
             "avg_confidence": float(row.avg_conf or 0.0)
         }
 
@@ -101,3 +105,34 @@ class AnalyticsRepository:
         ).limit(limit).order_by(AnalyticsQueryLog.created_at.desc())
         result = await self.db.execute(stmt)
         return result.scalars().all()
+
+    async def get_confidence_distribution(self) -> List[dict]:
+        """Get distribution of confidence scores in 0.2 buckets."""
+        bucket = func.floor(AnalyticsQueryLog.confidence_score * 5) / 5.0
+        stmt = select(
+            bucket,
+            func.count(AnalyticsQueryLog.id)
+        ).where(
+            AnalyticsQueryLog.tenant_id == self.tenant_id
+        ).group_by(bucket).order_by(bucket)
+        
+        result = await self.db.execute(stmt)
+        rows = result.all()
+        
+        # Initialize buckets
+        distribution = {
+            "0.0-0.2": 0,
+            "0.2-0.4": 0,
+            "0.4-0.6": 0,
+            "0.6-0.8": 0,
+            "0.8-1.0": 0
+        }
+        
+        for floor_val, count in rows:
+            if floor_val < 0.2: distribution["0.0-0.2"] += count
+            elif floor_val < 0.4: distribution["0.2-0.4"] += count
+            elif floor_val < 0.6: distribution["0.4-0.6"] += count
+            elif floor_val < 0.8: distribution["0.6-0.8"] += count
+            else: distribution["0.8-1.0"] += count
+            
+        return [{"bucket": k, "count": v} for k, v in distribution.items()]

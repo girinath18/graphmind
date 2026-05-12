@@ -45,7 +45,6 @@ class AnalyticsSummary(Base):
 
     session_id = Column(
         SQLAlchemyUUID(as_uuid=True),
-        index=True,
         nullable=True,
     )
 
@@ -84,7 +83,6 @@ class AnalyticsQueryLog(Base):
 
     session_id = Column(
         SQLAlchemyUUID(as_uuid=True),
-        index=True,
         nullable=True,
     )
 

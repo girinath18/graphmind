@@ -24,6 +24,11 @@ from ...core.embeddings import EmbeddingGenerator
 from ...core.llm.deepinfra_llm import DeepInfraLLMClient, LLMResponse
 from ...core.billing.utils import is_billing_enabled
 
+# Analytics Integration
+from ..analytics.repository import AnalyticsRepository
+from ..analytics.schemas import AnalyticsQueryLogCreate
+from ..analytics.models import ResponseStatus
+
 
 logger = logging.getLogger(__name__)
 
@@ -199,12 +204,36 @@ Base Instruction:
 
         # 4. Stream chunks
         formatted_context = self._format_context(context)
+        
+        # Track start time for latency
+        start_time = datetime.now()
+        full_answer = []
+        
         async for chunk in self.llm_client.stream_answer(
             query, 
             formatted_context, 
             agent_persona=agent_persona
         ):
+            full_answer.append(chunk)
             yield chunk
+
+        # 5. ASYNC LOGGING (Background)
+        # Log to analytics in background to avoid blocking the stream completion
+        latency_ms = (datetime.now() - start_time).total_seconds() * 1000
+        confidence = sum(c.hybrid_score for c in context.chunks) / len(context.chunks) if context.chunks else 0.0
+        status = ResponseStatus.SUCCESS if context.chunks else ResponseStatus.UNANSWERED
+        
+        try:
+            analytics_repo = AnalyticsRepository(self.db, UUID(self.tenant_id))
+            await analytics_repo.create_query_log({
+                "query": query,
+                "response_status": status,
+                "confidence_score": confidence,
+                "latency_ms": latency_ms
+            })
+            await self.db.commit()
+        except Exception as ae:
+            logger.warning(f"⚠️ Failed to log analytics for stream: {ae}")
 
     async def generate_answer(
         self,
@@ -252,6 +281,7 @@ Base Instruction:
         logger.info(
             f"🧠 RAG Service: Generating answer for agent={agent_id}, kb={kb_id}"
         )
+        start_time_total = datetime.now()
 
         # ============= STEP 1: VALIDATION: KB ownership (required for cache key with version) =============
         kb_ids = [kb_id] if isinstance(kb_id, str) else kb_id
@@ -521,6 +551,20 @@ Base Instruction:
             )
 
         logger.info(f"✅ RAG complete: {len(context.chunks)} chunks → answer")
+
+        # ============= STEP 6.5: LOG TO ANALYTICS (PERSISTENT) =============
+        try:
+            analytics_repo = AnalyticsRepository(self.db, UUID(self.tenant_id))
+            await analytics_repo.create_query_log({
+                "query": query,
+                "response_status": ResponseStatus.SUCCESS if context.chunks else ResponseStatus.UNANSWERED,
+                "confidence_score": confidence,
+                "latency_ms": (datetime.now() - start_time_total).total_seconds() * 1000
+            })
+            # Note: We don't commit here, we let the caller or Step 9 handle it
+            # Actually, RAGService should probably commit its own analytics if it's independent
+        except Exception as ae:
+            logger.warning(f"⚠️ Failed to log query to analytics: {ae}")
 
         # ============= STEP 7: CACHE RESULT (FOR REPEATED QUERIES) =============
         self._cache_response(cache_key, response)

@@ -2,13 +2,13 @@
 Analytics Router - API endpoints for conversational intelligence.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from typing import List, Optional
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ...core.database import AsyncSessionLocal
-from ...core.auth.middleware import get_current_tenant_id
+# REMOVED: from ...core.auth.middleware import get_current_tenant_id
 from .schemas import (
     AnalyticsSummaryResponse, 
     AnalyticsSummaryCreate, 
@@ -21,6 +21,20 @@ from .repository import AnalyticsRepository
 from .service import AnalyticsService
 
 router = APIRouter(prefix="/api/v1/analytics", tags=["Analytics"])
+
+# Dependency to extract tenant from request state (set by middleware)
+async def get_current_tenant_id(request: Request) -> UUID:
+    """
+    Dependency to get tenant_id from request state.
+    CRITICAL: TenantContextMiddleware MUST be active.
+    """
+    tenant_id = getattr(request.state, "tenant_id", None)
+    if not tenant_id:
+        raise HTTPException(
+            status_code=401, 
+            detail="Unauthorized: Missing tenant context"
+        )
+    return UUID(str(tenant_id))
 
 # Dependency to get AnalyticsService
 async def get_analytics_service(
@@ -50,6 +64,33 @@ async def list_analytics_summaries(
 ):
     """Fetch paginated analytics summaries."""
     return await service.get_all_summaries(skip, limit)
+
+# ================= ADVANCED ANALYTICS APIs =================
+
+@router.get("/dashboard", response_model=DashboardMetrics)
+async def get_analytics_dashboard(
+    service: AnalyticsService = Depends(get_analytics_service)
+):
+    """Get aggregated dashboard metrics for the tenant."""
+    return await service.get_dashboard_metrics()
+
+@router.get("/unanswered", response_model=List[AnalyticsQueryLogResponse])
+async def get_unanswered_queries(
+    service: AnalyticsService = Depends(get_analytics_service)
+):
+    """Fetch recent queries that were unanswered or failed."""
+    return await service.get_unanswered_logs()
+
+@router.get("/query-log", response_model=List[AnalyticsQueryLogResponse])
+async def list_query_logs(
+    skip: int = 0,
+    limit: int = 100,
+    service: AnalyticsService = Depends(get_analytics_service)
+):
+    """Fetch paginated query analytics logs."""
+    return await service.repo.get_query_logs(skip, limit)
+
+# ================= SUMMARY APIs =================
 
 @router.get("/{id}", response_model=AnalyticsSummaryResponse)
 async def get_analytics_summary(
@@ -95,27 +136,3 @@ async def log_query_analytics(
     """Log an individual query's analytics."""
     return await service.log_query(data)
 
-@router.get("/query-log", response_model=List[AnalyticsQueryLogResponse])
-async def list_query_logs(
-    skip: int = 0,
-    limit: int = 100,
-    service: AnalyticsService = Depends(get_analytics_service)
-):
-    """Fetch paginated query analytics logs."""
-    return await service.repo.get_query_logs(skip, limit)
-
-# ================= ADVANCED ANALYTICS APIs =================
-
-@router.get("/dashboard", response_model=DashboardMetrics)
-async def get_analytics_dashboard(
-    service: AnalyticsService = Depends(get_analytics_service)
-):
-    """Get aggregated dashboard metrics for the tenant."""
-    return await service.get_dashboard_metrics()
-
-@router.get("/unanswered", response_model=List[AnalyticsQueryLogResponse])
-async def get_unanswered_queries(
-    service: AnalyticsService = Depends(get_analytics_service)
-):
-    """Fetch recent queries that were unanswered or failed."""
-    return await service.get_unanswered_logs()
